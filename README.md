@@ -1,8 +1,6 @@
-# B@IL — Antminer Monitor (CGIMiner)
+# Antminer Monitor (CGIMiner)
 
 > Remote monitor for CGIminer-based Antminers. Telegram commands + email alerts, with safe auto-restart logic.
-
-![B@IL Logo Placeholder](assets/logo.png)
 
 ## Quick summary
 Single-file Python monitor: **`miner.py`**.  
