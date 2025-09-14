@@ -1,0 +1,14 @@
+[Unit]
+Description=B@IL Antminer Monitor
+After=network.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/antminer-monitor
+ExecStart=/home/pi/antminer-monitor/venv/bin/python /home/pi/antminer-monitor/miner.py
+Restart=always
+RestartSec=10
+EnvironmentFile=/home/pi/antminer-monitor/.env
+
+[Install]
+WantedBy=multi-user.target
