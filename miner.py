@@ -503,17 +503,29 @@ def check_cycle():
                     state['last_power_notify_time'] = nowt
             return
 
-    # ping ok => if previously flagged power off, treat as restore
+    # Ping ok but we had previously flagged power off
     if state['power_off_notified']:
-        nowt = time.time()
-        state['last_power_restore_time'] = nowt
-        state['awaiting_hash_after_restore'] = True
-        state['suppress_until'] = nowt + POWER_RECENT_SUPPRESSION
-        notify("✅ POWER RESTORED",
-               f"Miner {MINER_IP} is reachable again.\nVerifying API and hashing...\n"
-               f"I will wait up to {int(POWER_RECENT_SUPPRESSION/60)} minutes for hashing to resume before advising restart.")
-        state['power_off_notified'] = False
-        state['last_power_notify_time'] = 0
+        data, raw = query_api('{"command":"summary"}')
+        if "__error__" in data:
+            # API still dead → treat as still OFFLINE
+            nowt = time.time()
+            if nowt - state['last_power_notify_time'] >= POWER_REMINDER_INTERVAL:
+                notify("⚡ POWER REMINDER",
+                    f"Miner {MINER_IP} still offline (API not responding).")
+                state['last_power_notify_time'] = nowt
+            return
+        else:
+            # Both ping + API good → declare true restore
+            nowt = time.time()
+            state['last_power_restore_time'] = nowt
+            state['awaiting_hash_after_restore'] = True
+            state['suppress_until'] = nowt + POWER_RECENT_SUPPRESSION
+            notify("✅ POWER RESTORED",
+                f"Miner {MINER_IP} is fully reachable again (API responding).\n"
+                f"Waiting up to {int(POWER_RECENT_SUPPRESSION/60)} minutes for hashing to resume.")
+            state['power_off_notified'] = False
+            state['last_power_notify_time'] = 0
+
 
     # Query summary
     data, raw = query_api('{"command":"summary"}')
