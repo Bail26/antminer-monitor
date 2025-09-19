@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-miner.py - Watchman for Antminer
+miner.py - Watchman for Antminer (final integrated version)
 
 Features:
  - Telegram commands: /status, /restart, /help (command replies only -> Telegram)
- - Alerts: power, API, zero-hash, temp (alerts -> Telegram + Email if EMAIL_TO set)
+ - Alerts: power, API, zero-hash (real-time), temp, live log scanner (alerts -> Telegram + Email if EMAIL_TO set)
  - Auto-restart logic (API->HTTP->SSH) (can be disabled)
  - Restart suppression windows and boot grace handling
- - Rotating logs (5MB, 7 backups)
+ - Rotating logs (5 MB, 7 rotated backups)
+ - Log scanning with toggles: reduce chatter, alerts-only, throttle interval
 """
 
 import socket, json, time, subprocess, sys, re, traceback
@@ -18,50 +19,54 @@ from email.mime.text import MIMEText
 import smtplib
 import logging
 from logging.handlers import RotatingFileHandler
+from collections import deque
 
-# Optional SSH
+# Optional SSH (paramiko used for SSH restart/log fetch)
 try:
     import paramiko
     HAS_PARAMIKO = True
 except Exception:
     HAS_PARAMIKO = False
 
-# ===================== CONFIG =====================
+# ===================== CONFIG - EDIT THESE =====================
 MINER_IP = "192.168.1.31"
 API_PORT = 4028
-POLL_INTERVAL = 60               # seconds
+POLL_INTERVAL = 60               # seconds between main loop cycles
 
-# Telegram (bot)
-TELEGRAM_TOKEN = ""
-TELEGRAM_CHAT_ID = ""  # default broadcast chat
+# Telegram
+TELEGRAM_TOKEN = "8378274795:AAH7Dh1ABoSItyCWbwki6tlQhogBLjwqArU"
+TELEGRAM_CHAT_ID = "6507077625"
 
 # Email (optional - App password recommended for Gmail)
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
-SMTP_USER = ""  # sender gmail
-SMTP_PASS = ""    # app password
-EMAIL_TO = ""   # leave empty to disable email alerts
+SMTP_USER = ""   # sender gmail address
+SMTP_PASS = ""   # app password
+EMAIL_TO = ""    # recipient; leave empty to disable email alerts
+
+# Email master toggle (if you want to temporarily disable email while credentials remain)
+EMAIL_ENABLED = True if EMAIL_TO else False
 
 # Auto-restart policy
-AUTO_RESTART_ENABLED = True
-RESTART_MIN_INTERVAL = 4 * 3600   # 4 hours
-RESTART_TIMEOUT = 300
-RESTART_POLL_INTERVAL = 15
+AUTO_RESTART_ENABLED = True    # set False to disable auto restarts
+RESTART_MIN_INTERVAL = 4 * 3600   # seconds between automatic restarts (4 hours)
+RESTART_TIMEOUT = 300             # wait for miner to recover after restart (seconds)
+RESTART_POLL_INTERVAL = 15        # how often to poll during recovery wait
 MAX_RESTART_ATTEMPTS_PER_EVENT = 1
 
 # Zero-hash thresholds and sleep window
-GHS_ZERO_THRESHOLD = 0.001
-TEMP_SLEEP_MIN = 30   # sleep-mode inlet/outlet min
-TEMP_SLEEP_MAX = 50   # sleep-mode inlet/outlet max
-TEMP_HIGH_LIMIT = 75  # block restarts >= this
-FAN_ON_THRESHOLD = 1
+GHS_ZERO_THRESHOLD = 0.001     # GH/s threshold considered as zero (applies to avg or realtime)
+TEMP_SLEEP_MIN = 30            # deg C (sleep temp lower bound)
+TEMP_SLEEP_MAX = 50            # deg C (sleep temp upper bound)
+TEMP_HIGH_LIMIT = 75           # deg C - block restarts if >= this
+FAN_ON_THRESHOLD = 1           # RPM considered "on"
 
 # Uptime & power rules
-MIN_UPTIME_BEFORE_AUTO_RESTART = 15 * 60   # 15 minutes to consider "running"
-POWER_RECENT_SUPPRESSION = 10 * 60         # after power restore wait this long
-POWER_REMINDER_INTERVAL = 5 * 60           # reminders for offline
+MIN_UPTIME_BEFORE_AUTO_RESTART = 15 * 60   # 15 minutes (avoid auto restart during early boot)
+POWER_RECENT_SUPPRESSION = 12 * 60         # 12 minutes after power restore wait for hashing
+POWER_REMINDER_INTERVAL = 5 * 60           # remind every 5 minutes when offline
 
-# HTTP/SSH credentials for fallback
+# HTTP/SSH credentials (for reboot + log fetch)
 RESTART_HTTP_USERNAME = "root"
 RESTART_HTTP_PASSWORD = "root"
 SSH_USERNAME = "root"
@@ -69,17 +74,49 @@ SSH_PASSWORD = "root"
 SSH_PORT = 22
 SSH_TIMEOUT = 10
 
-REBOOT_SUPPRESS_WINDOW = 180  # suppress offline alerts for a short time after we requested restart
+# Suppress power alerts for short time after we initiated restart
+REBOOT_SUPPRESS_WINDOW = 180  # seconds
 
-DRY_RUN = False   # True = do not actually send reboot commands (useful for testing)
+# DRY_RUN flag (prevent real reboots while testing)
+DRY_RUN = False   # Set True to avoid making restart calls
 
-# Logging rotation
+# Logging config - rotation
 LOGFILE = "miner_watchman.log"
-LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_MAX_BYTES = 5 * 1024 * 1024   # 5 MB
 LOG_BACKUP_COUNT = 7
-# ==================================================
+# ===============================================================
 
-# ---------- Logging ----------
+# ---------------- Log polling config & tokens ----------------
+LOG_HTTP_ENDPOINTS = [
+    "/cgi-bin/get_log.cgi",
+    "/cgi-bin/minerLog.cgi",
+    "/cgi-bin/get_system_info.cgi",
+    "/cgi-bin/minerStatus.cgi",
+    "/cgi-bin/get_log",
+    "/log",
+    "/tmp/log",
+]
+LOG_SSH_PATHS = [
+    "/var/log/messages",
+    "/var/log/syslog",
+    "/var/log/miner.log",
+    "/tmp/log",
+]
+LOG_DEQUE_MAX = 400
+
+LOGSCAN_REDUCE_CHATTER = True        # if True, suppress "no new log lines" messages
+LOGSCAN_ALERTS_ONLY = True         # if True, only notify on matches and don't log "scanned X lines; no matches"
+LOGSCAN_THROTTLE_INTERVAL = 300      # seconds between log fetches (0 = no throttle)
+
+LOG_ERROR_TOKENS = [
+    "reg crc", "regcrc", "regc", "crc", "reg_crc", "!!! reg crc error",
+    "error_power", "voltage", "sleep", "sleeping", "cannot", "connection refused",
+    "lost connection", "disconnect", "fatal", "panic", "hw error", "hardware error",
+    "no matching work", "no work", "no share"
+]
+# ===============================================================
+
+# ---------- Logging setup ----------
 logger = logging.getLogger("miner_watchman")
 logger.setLevel(logging.INFO)
 fmt = logging.Formatter("[%(asctime)s] %(message)s", "%Y-%m-%d %H:%M:%S")
@@ -131,11 +168,10 @@ def send_telegram_to(chat_id, text):
         return False
 
 def send_telegram(text):
-    # broadcast to default chat (used for alerts)
     return send_telegram_to(TELEGRAM_CHAT_ID, text)
 
 def send_email(subject, body):
-    if not EMAIL_TO:
+    if not EMAIL_TO or not EMAIL_ENABLED:
         return False
     try:
         msg = MIMEText(body)
@@ -155,9 +191,10 @@ def send_email(subject, body):
 def notify(title, body, email=True):
     """
     Central notify function.
-    - title: short subject/title
-    - body: detailed text
-    - email: boolean; if False -> only send Telegram (used for command replies)
+    title: short subject/title
+    body: detailed text
+    email: boolean; if False -> only send Telegram (used for command replies).
+           If True and EMAIL_TO set and EMAIL_ENABLED is True -> send email.
     """
     message = f"{title}\n\n{body}"
     # Always log
@@ -167,8 +204,8 @@ def notify(title, body, email=True):
         send_telegram(message)
     except Exception as e:
         log("Telegram broadcast failed: " + str(e))
-    # Email if allowed and configured
-    if email and EMAIL_TO:
+    # Email if allowed and requested
+    if email and EMAIL_TO and EMAIL_ENABLED:
         send_email(title, body)
 
 # ---------------- Network / API ----------------
@@ -230,7 +267,6 @@ def restart_via_api():
                 if isinstance(statuses, list) and statuses:
                     msg = str(statuses[0].get("Msg","")).lower()
                     st = statuses[0].get("STATUS","")
-                    # If API returns error-like response treat as rejection
                     if "invalid" in msg or str(st).upper() == "E" or "error" in msg:
                         log("API restart rejected: " + msg)
                         continue
@@ -298,15 +334,14 @@ def attempt_restart(trigger="auto", notify_email=True):
     """
     Attempt restart using API -> HTTP -> SSH.
     trigger: "auto" or "manual"
-    notify_email: if False, do not send email notifications from inside this function (useful for manual command)
-    Returns True if any method succeeded.
+    notify_email: if False, do not send email notifications for the restart event
+    Returns True if any method accepted the restart command (does not guarantee recovery).
     """
     nowt = time.time()
     if trigger == "auto" and nowt - state.get('last_auto_restart_time', 0) < RESTART_MIN_INTERVAL:
         log("Auto-restart suppressed due to minimum interval.")
         return False
 
-    # Use notify with email flag
     notify("🔁 AUTO-RESTART: Initiating" if trigger=="auto" else "🔁 MANUAL RESTART: Initiating",
            f"Attempting restart of miner {MINER_IP}. Methods: API -> HTTP -> SSH. DRY_RUN={DRY_RUN}. Trigger={trigger}",
            email=notify_email)
@@ -346,7 +381,7 @@ def format_boards_summary(boards):
         parts.append(f"{b['name']}: chips={b['chips']} hw={b['hw_err']} hr={int(b.get('mhs',0))}MH/s {in_s} {out_s}")
     return " | ".join(parts)
 
-# ---------------- Quick status payload ----------------
+# ---------------- Quick status payload (for /status) ----------------
 def quick_status_payload():
     try:
         ping_ok = ping(MINER_IP)
@@ -358,7 +393,7 @@ def quick_status_payload():
         ghs = None; elapsed=None; acc=None; rej=None
         if "SUMMARY" in data and data["SUMMARY"]:
             s = data["SUMMARY"][0]
-            try: ghs = float(s.get("GHS 30m") or s.get("GHS av") or 0)
+            try: ghs = float(s.get("GHS 30m") or s.get("GHS av") or s.get("GHS 5s") or 0)
             except: ghs=None
             try: elapsed = int(s.get("Elapsed") or 0)
             except: elapsed=None
@@ -436,15 +471,24 @@ def process_telegram_commands():
             elif cmd == "/restart":
                 log(f"Telegram command /restart from {chat_id}")
                 send_telegram_to(chat_id, f"🔁 Manual restart requested. DRY_RUN={DRY_RUN}. Attempting restart now...")
-                # Manual restart: do not trigger email from attempt_restart() to satisfy your requirement
+                # Manual restart: do not trigger email notifications from attempt_restart()
                 success = attempt_restart(trigger="manual", notify_email=False)
                 if success:
                     send_telegram_to(chat_id, "✅ Manual restart attempt executed (check logs for details).")
+                    # wait for miner to resume hashing (non-blocking short loop with timeout)
+                    recovered = wait_for_recovery(timeout=RESTART_TIMEOUT, poll=RESTART_POLL_INTERVAL, ghs_threshold=1.0)
+                    if recovered:
+                        notify("✅ Manual restart — miner resumed hashing", f"Miner {MINER_IP} resumed hashing after manual restart.")
+                        # let chat know as well
+                        send_telegram_to(chat_id, "✅ Miner resumed hashing after manual restart.")
+                    else:
+                        # not recovered within wait window
+                        send_telegram_to(chat_id, f"⚠️ Miner did not resume hashing within {RESTART_TIMEOUT} seconds after restart. Manual check required.")
                 else:
                     send_telegram_to(chat_id, "❌ Manual restart failed. See logs.")
             elif cmd == "/help":
                 help_text = ("/status - show live status\n/restart - manual restart (override)\n/help - this help\n"
-                             f"DRY_RUN={DRY_RUN} AUTO_RESTART_ENABLED={AUTO_RESTART_ENABLED}")
+                             f"DRY_RUN={DRY_RUN} AUTO_RESTART_ENABLED={AUTO_RESTART_ENABLED}\nEmail enabled: {EMAIL_ENABLED}")
                 send_telegram_to(chat_id, help_text)
     except Exception as e:
         log("process_telegram_commands error: " + str(e))
@@ -464,24 +508,166 @@ state = {
     'suppress_until': 0,
     'tg_update_offset': 0,
     'last_ghs': None,
-    'last_restart_attempt_time': 0
+    'last_restart_attempt_time': 0,
+    # log scanner:
+    'seen_log_lines': deque(maxlen=LOG_DEQUE_MAX),
+    'log_alerted_lines': set(),
+    'last_log_scan_time': 0,
 }
 
-# ---------------- Error scanning ----------------
+# ---------------- Log scanning helpers ----------------
+def scan_for_errors_line(line):
+    """Return token matched or None."""
+    if not isinstance(line, str): return None
+    low = line.lower()
+    for t in LOG_ERROR_TOKENS:
+        if t in low:
+            return t
+    return None
+
+def fetch_logs():
+    """
+    Try: API -> HTTP endpoints -> SSH file tails.
+    Returns (ok_bool, text, method_str)
+    """
+    # 1) API 'log' command
+    try:
+        data, raw = query_api('{"command":"log"}', timeout=4)
+        if "__error__" not in data:
+            # try extracting strings from JSON, else fallback to raw
+            if isinstance(data, dict):
+                txts = []
+                def extract_strings(obj):
+                    out = []
+                    if isinstance(obj, dict):
+                        for v in obj.values(): out.extend(extract_strings(v))
+                    elif isinstance(obj, list):
+                        for i in obj: out.extend(extract_strings(i))
+                    elif isinstance(obj, str):
+                        out.append(obj)
+                    return out
+                txts = extract_strings(data)
+                txt = "\n".join(txts).strip()
+                if not txt:
+                    txt = raw if isinstance(raw, str) else ""
+                if txt:
+                    return True, txt, "api_log"
+    except Exception:
+        pass
+
+    # 2) HTTP endpoints
+    auth = HTTPDigestAuth(RESTART_HTTP_USERNAME, RESTART_HTTP_PASSWORD)
+    for p in LOG_HTTP_ENDPOINTS:
+        url = f"http://{MINER_IP}{p}"
+        try:
+            r = requests.get(url, auth=auth, timeout=6, allow_redirects=True)
+            if r.status_code == 200 and r.text:
+                body = r.text
+                if "<html" in body.lower() or "<div" in body.lower() or "<table" in body.lower():
+                    text = re.sub(r"<[^>]+>", "", body)
+                else:
+                    text = body
+                text = text.strip()
+                if text:
+                    return True, text, f"http:{p}"
+        except Exception as e:
+            log(f"[logfetch] HTTP log try {url} error: {e}")
+            continue
+
+    # 3) SSH tail files
+    if HAS_PARAMIKO:
+        try:
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(MINER_IP, port=SSH_PORT, username=SSH_USERNAME, password=SSH_PASSWORD, timeout=SSH_TIMEOUT)
+            for path in LOG_SSH_PATHS:
+                try:
+                    cmd = f"tail -n 500 {path}"
+                    stdin, stdout, stderr = ssh.exec_command(cmd, timeout=8)
+                    out = stdout.read().decode(errors="ignore") if stdout else ""
+                    if out and len(out.strip())>5:
+                        ssh.close()
+                        return True, out.strip(), f"ssh:{path}"
+                except Exception:
+                    continue
+            ssh.close()
+        except Exception as e:
+            log("SSH log fetch failed: " + str(e))
+
+    return False, "", "none"
+
+def process_logs_once():
+    # throttle
+    if LOGSCAN_THROTTLE_INTERVAL > 0:
+        if time.time() - state.get('last_log_scan_time', 0) < LOGSCAN_THROTTLE_INTERVAL:
+            return
+        state['last_log_scan_time'] = time.time()
+
+    ok, text, method = fetch_logs()
+    if not ok or not text:
+        if not LOGSCAN_REDUCE_CHATTER:
+            log(f"[logscan] No logs fetched via method {method}")
+        return
+
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if not lines:
+        if not LOGSCAN_REDUCE_CHATTER:
+            log(f"[logscan] No lines parsed from logs (method {method})")
+        return
+
+    new_lines = []
+    seen = state['seen_log_lines']
+    for l in lines:
+        if l not in seen:
+            new_lines.append(l)
+            seen.append(l)
+
+    if not new_lines:
+        if not LOGSCAN_REDUCE_CHATTER:
+            log(f"[logscan] no new log lines to scan (method {method})")
+        return
+
+    alerted = []
+    for l in new_lines:
+        token = scan_for_errors_line(l)
+        if token:
+            if l in state['log_alerted_lines']:
+                continue
+            excerpt = (l[:800]) if len(l)>800 else l
+            body = f"Miner: {MINER_IP}\nLog method: {method}\nMatched token: {token}\n\nLog line:\n{excerpt}"
+            notify(f"⚠️ LOG ALERT: {token.upper()}", body)
+            state['log_alerted_lines'].add(l)
+            alerted.append((token, l))
+
+    if alerted:
+        log(f"[logscan] alerted on {len(alerted)} new log lines (method {method})")
+    else:
+        if not LOGSCAN_ALERTS_ONLY:
+            log(f"[logscan] scanned {len(new_lines)} new lines; no matches (method {method})")
+
+# ---------------- API raw scanning ----------------
 def scan_for_errors(raw):
     if not isinstance(raw, str): return None
     low = raw.lower()
-    # ignore noisy 'hardware error' text per your request
-    if "hardware error" in low:
+    # avoid noisy matches for generic 'hardware error' unless reg crc included
+    if "hardware error" in low and "reg crc" not in low:
         return None
-    tokens = ["regc", "reg crc", "crc", "reg_crc", "error_power", "cannot", "connection refused", "lost connection", "disconnect", "fatal", "panic"]
+    tokens = ["regc", "reg crc", "crc", "reg_crc",
+              "error_power", "cannot", "connection refused", "lost connection",
+              "disconnect", "fatal", "panic"]
     for t in tokens:
         if t in low:
             return t
     return None
 
-# ---------------- Main check logic ----------------
+# ---------------- Main check cycle ----------------
 def check_cycle():
+    # 0) process logs first
+    try:
+        process_logs_once()
+    except Exception as e:
+        log("process_logs_once error: " + str(e))
+
     # 1) ping for power detection
     ping_ok = ping(MINER_IP)
     if not ping_ok:
@@ -503,19 +689,16 @@ def check_cycle():
                     state['last_power_notify_time'] = nowt
             return
 
-    # Ping ok but we had previously flagged power off
+    # Ping ok but previously flagged power off -> require API responding to declare restore
     if state['power_off_notified']:
         data, raw = query_api('{"command":"summary"}')
         if "__error__" in data:
-            # API still dead → treat as still OFFLINE
             nowt = time.time()
             if nowt - state['last_power_notify_time'] >= POWER_REMINDER_INTERVAL:
-                notify("⚡ POWER REMINDER",
-                    f"Miner {MINER_IP} still offline (API not responding).")
+                notify("⚡ POWER REMINDER", f"Miner {MINER_IP} still offline (API not responding).")
                 state['last_power_notify_time'] = nowt
             return
         else:
-            # Both ping + API good → declare true restore
             nowt = time.time()
             state['last_power_restore_time'] = nowt
             state['awaiting_hash_after_restore'] = True
@@ -526,8 +709,7 @@ def check_cycle():
             state['power_off_notified'] = False
             state['last_power_notify_time'] = 0
 
-
-    # Query summary
+    # 2) query summary
     data, raw = query_api('{"command":"summary"}')
     if "__error__" in data:
         nowt = time.time()
@@ -545,21 +727,29 @@ def check_cycle():
     try:
         if "SUMMARY" in data and data["SUMMARY"]:
             s = data["SUMMARY"][0]
-            ghs_30m = float(s.get("GHS 30m") or s.get("GHS av") or s.get("GHS 5s") or 0)
-            elapsed = int(s.get("Elapsed") or 0)
+            # try to extract 30m avg or fallback to any available summary value
+            try: ghs_30m = float(s.get("GHS 30m") or s.get("GHS av") or s.get("GHS 5s") or 0)
+            except: ghs_30m = 0.0
+            try: elapsed = int(s.get("Elapsed") or 0)
+            except: elapsed = None
+
+        # fetch stats for per-board info (used to compute realtime hash)
         stats_data, stats_raw = query_api('{"command":"stats"}')
         if isinstance(stats_data, dict) and "STATS" in stats_data and isinstance(stats_data["STATS"], list):
             st = stats_data["STATS"][1] if len(stats_data["STATS"])>1 else stats_data["STATS"][0]
-            fan_num = int(st.get("fan_num",0) or 0)
+            # fans
+            try:
+                fan_num = int(st.get("fan_num",0) or 0)
+            except:
+                fan_num = 0
             for i in range(1, fan_num+1):
-                try: fans[f"fan{i}"] = int(st.get(f"fan{i}",0) or 0)
-                except: pass
-            temps=[]
-            for k in ("temp1","temp2","temp3"):
-                if k in st:
-                    try: temps.append(int(st[k]))
-                    except: pass
-            if temps: temp_max = max(temps)
+                fi = st.get(f"fan{i}")
+                if fi is not None:
+                    try:
+                        fans[f"fan{i}"] = int(fi)
+                    except:
+                        pass
+            # per-board parsing
             for bi in range(1,4):
                 inlet=None; outlet=None
                 chip_str = st.get(f"temp_chip{bi}")
@@ -569,45 +759,77 @@ def check_cycle():
                         vals=[int(x) for x in parts] if parts else []
                         if vals:
                             inlet=vals[0]; outlet=vals[-1]
-                    except: pass
-                try: chips=int(st.get(f"chain_acn{bi}",77) or 77)
-                except: chips=77
-                try: hw_err=int(st.get(f"chain_hw{bi}",0) or 0)
-                except: hw_err=0
-                try: mhs=float(st.get(f"chain_rate{bi}",0) or 0)
-                except: mhs=0.0
-                boards.append({"id":bi,"name":f"Board{bi}","chips":chips,"hw_err":hw_err,"mhs":mhs,"inlet":inlet,"outlet":outlet})
+                    except:
+                        pass
+                try:
+                    mhs = float(st.get(f"chain_rate{bi}",0) or 0)
+                except:
+                    mhs = 0.0
+                try:
+                    chips = int(st.get(f"chain_acn{bi}",77) or 77)
+                except:
+                    chips = 77
+                try:
+                    hw_err = int(st.get(f"chain_hw{bi}",0) or 0)
+                except:
+                    hw_err = 0
+                boards.append({
+                    "id": bi,
+                    "name": f"Board{bi}",
+                    "chips": chips,
+                    "hw_err": hw_err,
+                    "mhs": mhs,       # mhs is likely in MH/s (as reported by many firmwares)
+                    "inlet": inlet,
+                    "outlet": outlet
+                })
             boards_summary = format_boards_summary(boards)
     except Exception as e:
         log("Parse error: " + str(e))
 
+    # compute realtime GH/s from boards (sum of chain_rate mhs -> convert MH/s -> GH/s)
+    try:
+        realtime_mhs = sum((b.get('mhs') or 0.0) for b in boards)
+        realtime_ghs = realtime_mhs / 1000.0  # convert MH/s to GH/s
+    except Exception:
+        realtime_ghs = None
+
     elapsed_str = format_elapsed(elapsed) if elapsed is not None else "?"
     if boards_summary:
-        log(f"GHS30m={ghs_30m}, elapsed={elapsed_str}, fans={format_fans(fans)}\nBoards: {boards_summary}")
+        log(f"GHS30m={ghs_30m}, realtimeGHs={realtime_ghs}, elapsed={elapsed_str}, fans={format_fans(fans)}\nBoards: {boards_summary}")
     else:
-        log(f"GHS30m={ghs_30m}, elapsed={elapsed_str}, fans={format_fans(fans)}")
+        log(f"GHS30m={ghs_30m}, realtimeGHs={realtime_ghs}, elapsed={elapsed_str}, fans={format_fans(fans)}")
 
-    # scan for errors (excluding 'hardware error')
-    token = scan_for_errors(raw)
-    if token:
-        try:
-            s0 = data["SUMMARY"][0] if "SUMMARY" in data and data["SUMMARY"] else {}
-            ghs = float(s0.get("GHS 30m", s0.get("GHS av", 0)) or 0)
-            elapsed2 = int(s0.get("Elapsed", 0) or 0)
-            acc = int(s0.get("Accepted", 0) or 0)
-            rej = int(s0.get("Rejected", 0) or 0)
-        except:
-            ghs=None; elapsed2=None; acc=None; rej=None
-        short_lines=[]
-        if ghs is not None: short_lines.append(f"30m: {ghs:,.2f} GH/s")
-        if elapsed2 is not None: short_lines.append(f"Elapsed: {format_elapsed(elapsed2)}")
-        if acc is not None and rej is not None: short_lines.append(f"Acc/Rej: {acc}/{rej}")
-        short_body = " | ".join(short_lines)
-        raw_excerpt = (raw or "")[:200].replace("\n"," ").replace("\r"," ")
-        notify(f"⚠️ ERROR: {token.upper()}", f"{short_body}\n\nToken: {token}\nRaw excerpt: {raw_excerpt}")
+    # scan API raw for tokens (short scan)
+    try:
+        token = scan_for_errors(raw)
+        if token:
+            try:
+                s0 = data["SUMMARY"][0] if "SUMMARY" in data and data["SUMMARY"] else {}
+                ghs = float(s0.get("GHS 30m", s0.get("GHS av", 0)) or 0)
+                elapsed2 = int(s0.get("Elapsed", 0) or 0)
+                acc = int(s0.get("Accepted", 0) or 0)
+                rej = int(s0.get("Rejected", 0) or 0)
+            except:
+                ghs=None; elapsed2=None; acc=None; rej=None
+            short_lines=[]
+            if ghs is not None: short_lines.append(f"30m: {ghs:,.2f} GH/s")
+            if elapsed2 is not None: short_lines.append(f"Elapsed: {format_elapsed(elapsed2)}")
+            if acc is not None and rej is not None: short_lines.append(f"Acc/Rej: {acc}/{rej}")
+            short_body = " | ".join(short_lines)
+            raw_excerpt = (raw or "")[:400].replace("\n"," ").replace("\r"," ")
+            notify(f"⚠️ ERROR: {token.upper()}", f"{short_body}\n\nToken: {token}\nRaw excerpt: {raw_excerpt}")
+    except Exception as e:
+        log("scan_for_errors(api) error: " + str(e))
 
-    # ---------------- Zero-hash handling & auto-restart decision ----------------
-    if ghs_30m is not None and ghs_30m <= GHS_ZERO_THRESHOLD:
+    # ------------------- Zero-hash handling & auto-restart decision -------------------
+    # Use realtime_ghs primarily for detecting current zero-hash; fallback to ghs_30m if realtime unknown
+    current_ghs_to_check = None
+    if realtime_ghs is not None:
+        current_ghs_to_check = realtime_ghs
+    else:
+        current_ghs_to_check = ghs_30m
+
+    if current_ghs_to_check is not None and current_ghs_to_check <= GHS_ZERO_THRESHOLD:
         nowt = time.time()
         fans_on = any(v > FAN_ON_THRESHOLD for v in fans.values()) if fans else False
 
@@ -620,8 +842,8 @@ def check_cycle():
             vals=[]
             if outlet_vals: vals.extend(outlet_vals)
             if inlet_vals: vals.extend(inlet_vals)
-            max_temp = max(vals) if vals else None
-            # require that each board has either inlet or outlet in sleep range
+            if vals:
+                max_temp = max(vals)
             ok = True
             for b in boards:
                 bi_ok = False
@@ -634,12 +856,11 @@ def check_cycle():
                     break
             temp_ok_for_sleep = ok
 
-        body_common = (f"Miner: {MINER_IP}\nHashrate (30m): {ghs_30m} GH/s\nUptime: {elapsed_str}\nFans: {format_fans(fans)}\nBoards: {boards_summary}\n")
+        body_common = (f"Miner: {MINER_IP}\nHashrate (30m): {ghs_30m} GH/s\nRealtime GH/s: {realtime_ghs}\nUptime: {elapsed_str}\nFans: {format_fans(fans)}\nBoards: {boards_summary}\n")
 
         # If we are in power-restore grace window — special handling
         if state.get('awaiting_hash_after_restore'):
-            if ghs_30m > GHS_ZERO_THRESHOLD:
-                # resumed fast — notify resumed
+            if current_ghs_to_check > GHS_ZERO_THRESHOLD:
                 notify("✅ Miner resumed hashing after power restore", body_common + "\nMiner resumed hashing within the grace period after power restore.")
                 state['last_elapsed'] = elapsed
                 state['awaiting_hash_after_restore'] = False
@@ -668,7 +889,7 @@ def check_cycle():
             state['suppress_until'] = 0
             return
 
-        # Now normal running-but-not-hashing case
+        # Normal running-but-not-hashing case:
         if elapsed is None:
             log("Elapsed unknown; sending notification.")
             notify("🛑 ZERO HASH (unknown uptime)", body_common + "\nUptime unknown; manual check required.")
@@ -693,7 +914,7 @@ def check_cycle():
             notify("🔥 NO AUTO-RESTART (high temp)", body_common + f"\nMax temp {max_temp}°C >= {TEMP_HIGH_LIMIT}°C. Do not auto-restart; inspect cooling.")
             return
 
-        # check 4-hour gap and attempt counts
+        # Check 4-hour gap since last auto restart
         nowt = time.time()
         if nowt - state.get('last_auto_restart_time',0) < RESTART_MIN_INTERVAL:
             rem = int((RESTART_MIN_INTERVAL - (nowt - state['last_auto_restart_time']))/60)
@@ -704,7 +925,7 @@ def check_cycle():
             notify("⚠️ AUTO-RESTART LIMIT REACHED", body_common + "\nAlready attempted allowed auto-restarts for this event.")
             return
 
-        # Passed: attempt auto restart
+        # Passed all checks: attempt auto-restart
         log("Conditions met for AUTO-RESTART (zero-hash mid-run). Attempting restart.")
         notify("🚨 AUTO-RESTART: Attempting safe restart", body_common + "\nConditions met: zero-hash mid-run, fans on, temps ~30-50°C, uptime >=15m.")
         state['last_restart_attempt_time'] = time.time()
@@ -726,14 +947,14 @@ def check_cycle():
             notify("❌ AUTO-RESTART ATTEMPT FAILED", "Restart attempts (API/HTTP/SSH) all failed. Manual intervention required.")
         return
 
-    # If hashing healthy -> reset counters (and handle 'resumed after power restore')
-    if ghs_30m is not None and ghs_30m > GHS_ZERO_THRESHOLD:
+    # If hashing healthy -> reset counters and handle 'resumed after power restore'
+    if current_ghs_to_check is not None and current_ghs_to_check > GHS_ZERO_THRESHOLD:
         if state.get('restart_attempts_for_event',0) != 0:
             log("Miner hashing again; resetting restart attempts.")
         state['restart_attempts_for_event'] = 0
         state['last_auto_restart_time'] = state.get('last_auto_restart_time',0) if state.get('last_auto_restart_time',0) else 0
         if state.get('awaiting_hash_after_restore'):
-            notify("✅ Miner resumed hashing after power restore", f"Miner {MINER_IP} resumed hashing: {ghs_30m} GH/s. Uptime: {elapsed_str}\nBoards: {boards_summary}")
+            notify("✅ Miner resumed hashing after power restore", f"Miner {MINER_IP} resumed hashing: {current_ghs_to_check} GH/s. Uptime: {elapsed_str}\nBoards: {boards_summary}")
             state['last_elapsed'] = elapsed
             state['awaiting_hash_after_restore'] = False
             state['suppress_until'] = 0
@@ -786,29 +1007,53 @@ def check_cycle():
 
 # ---------------- Wait for recovery helper ----------------
 def wait_for_recovery(timeout=RESTART_TIMEOUT, poll=RESTART_POLL_INTERVAL, ghs_threshold=1.0):
+    """
+    Poll until the miner's realtime GH/s >= ghs_threshold or timeout.
+    Returns True if recovered.
+    """
     start = time.time()
     while time.time() - start < timeout:
         try:
             process_telegram_commands()
         except Exception:
             log("process_telegram_commands (during recovery) error: " + traceback.format_exc())
+        # query summary and stats to compute realtime
         data, raw = query_api('{"command":"summary"}')
-        if "__error__" not in data and "SUMMARY" in data and isinstance(data["SUMMARY"], list) and data["SUMMARY"]:
+        if "__error__" not in data:
+            # try to get realtime from stats
+            stats_data, stats_raw = query_api('{"command":"stats"}')
+            realtime = None
             try:
-                g = float(data["SUMMARY"][0].get("GHS 30m", 0) or 0)
-                log(f"Recovery poll: GHS30m={g}")
-                if g >= ghs_threshold:
-                    return True
-            except:
+                if isinstance(stats_data, dict) and "STATS" in stats_data and isinstance(stats_data["STATS"], list):
+                    st = stats_data["STATS"][1] if len(stats_data["STATS"])>1 else stats_data["STATS"][0]
+                    mhs_sum = 0.0
+                    for bi in range(1,4):
+                        try:
+                            mhs_sum += float(st.get(f"chain_rate{bi}",0) or 0.0)
+                        except:
+                            pass
+                    realtime = mhs_sum / 1000.0  # MH/s -> GH/s
+            except Exception:
                 pass
-        sleep_chunk = min(1.0, poll)
-        time.sleep(sleep_chunk)
+            # also check SUMMARY's GHS 5s or 30m if realtime not available
+            try:
+                ghs30 = float(data["SUMMARY"][0].get("GHS 30m") or data["SUMMARY"][0].get("GHS av") or data["SUMMARY"][0].get("GHS 5s") or 0)
+            except:
+                ghs30 = 0.0
+            cur = realtime if realtime is not None else ghs30
+            log(f"Recovery poll: realtime GH/s = {realtime}, summary GH/s = {ghs30}")
+            if cur is not None and cur >= ghs_threshold:
+                return True
+        time.sleep(max(1.0, poll))
     return False
+
+# (We keep the earlier quick_status_payload implementation; to avoid duplication we reuse its name)
+# Note: above we already defined quick_status_payload earlier; ensure correct binding - it's fine.
 
 # ---------------- Main ----------------
 def main():
     if not HAS_PARAMIKO:
-        log("Paramiko not installed - SSH restart disabled.")
+        log("Paramiko not installed - SSH log/restart disabled.")
     log(f"Starting miner_watchman (AUTO_RESTART_ENABLED={AUTO_RESTART_ENABLED}, DRY_RUN={DRY_RUN}) for {MINER_IP}")
     while True:
         try:
