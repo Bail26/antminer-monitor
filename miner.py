@@ -34,8 +34,8 @@ API_PORT = 4028
 POLL_INTERVAL = 60               # seconds between main loop cycles
 
 # Telegram
-TELEGRAM_TOKEN = "8378274795:AAH7Dh1ABoSItyCWbwki6tlQhogBLjwqArU"
-TELEGRAM_CHAT_ID = "6507077625"
+TELEGRAM_TOKEN = "telegram token"
+TELEGRAM_CHAT_ID = "your telegram chatid"
 
 # Email (optional - App password recommended for Gmail)
 SMTP_SERVER = "smtp.gmail.com"
